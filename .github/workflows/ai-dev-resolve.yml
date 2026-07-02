@@ -1,0 +1,233 @@
+name: AI Dev — resolver ticket (Fase B · abre PR)
+
+# AI Dev Squad — Fase B. Disparado pelo backend (workflow_dispatch) quando um
+# ticket ai_autonomous/ai_assisted entra e AI_DEV_RESOLVE_ENABLED=true. Roda o
+# Claude Code com permissão de EDITAR arquivos (numa branch), valida via guard
+# (Approval Matrix + piso hardcoded), roda typecheck, e abre um PR pra revisão
+# humana. NUNCA mergeia em main (branch protection é o backstop).
+#
+# PRÉ-REQUISITO de segurança: o repo `curseduca/waid-assistent-ai` PRECISA ter
+# branch protection no `main` (required reviews, sem push direto, GITHUB_TOKEN
+# NÃO no bypass) antes de ligar AI_DEV_RESOLVE_ENABLED em prod.
+#
+# Inputs (title/description) vêm de ticket de usuário → tratados como DADO
+# (env vars, nunca interpolados dentro de `run:`) pra evitar script injection.
+#
+# Secrets: buscados em runtime via OIDC no AWS Secrets Manager (secret consolidado
+# do waid-assistent-ai → ANTHROPIC_API_KEY, WAID_CI_TOKEN). NÃO ficam armazenados
+# como GitHub Actions secrets. Var WAID_API_BASE opcional. (WAID-1803)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_id: { description: 'UUID do ticket', required: true }
+      public_id: { description: 'WAID-N', required: false, default: '' }
+      title: { description: 'Título', required: true }
+      description: { description: 'Descrição', required: false, default: '' }
+      execution_id: { description: 'AIEmployerExecution id', required: false, default: '' }
+      model: { description: 'Modelo Claude Code (opus|sonnet|haiku); vazio = default', required: false, default: '' }
+      context_brief: { description: 'Brief técnico do Deep Analyzer (contexto acumulado); vazio = sem brief', required: false, default: '' }
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write # OIDC → assume a role AWS p/ ler os secrets em runtime
+
+concurrency:
+  group: ai-dev-resolve-${{ github.event.inputs.ticket_id }}
+  cancel-in-progress: true
+
+env:
+  REPO: ${{ github.repository }}
+  WAID_API_BASE: ${{ vars.WAID_API_BASE || 'https://waid-assistent-ai.curseduca.pro/api' }}
+  # WAID_CI_TOKEN e ANTHROPIC_API_KEY são carregados via OIDC/Secrets Manager no
+  # step "Carregar secrets" (GITHUB_ENV) — não vêm mais de secrets.* (WAID-1803).
+  TICKET_ID: ${{ github.event.inputs.ticket_id }}
+  PUBLIC_ID: ${{ github.event.inputs.public_id }}
+  TITLE: ${{ github.event.inputs.title }}
+  DESCRIPTION: ${{ github.event.inputs.description }}
+  EXECUTION_ID: ${{ github.event.inputs.execution_id }}
+  MODEL: ${{ github.event.inputs.model }}
+  CONTEXT_BRIEF: ${{ github.event.inputs.context_brief }}
+  BRANCH: ai-dev/waid-${{ github.event.inputs.public_id }}-${{ github.run_id }}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # OIDC → assume a role de menor privilégio (só GetSecretValue no secret do
+      # waid-assistent-ai). Nenhum token longevo armazenado no GitHub. (WAID-1803)
+      - name: AWS OIDC (assume role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::275864643767:role/curseduca-production-github-actions-ai-dev
+          aws-region: us-east-1
+
+      - name: Carregar secrets do AI Dev (Secrets Manager)
+        run: |
+          set -euo pipefail
+          SF="$RUNNER_TEMP/aidev-secret.json"
+          aws secretsmanager get-secret-value \
+            --secret-id /curseduca/production/us-east-1/waid-assistent-ai \
+            --query SecretString --output text > "$SF"
+          # O secret consolidado tem valores com control chars (newline) → JSON
+          # não-estrito. jq rejeita; python com strict=False parseia. Só extraímos
+          # as 2 chaves que o AI Dev usa; as demais nem tocam o ambiente.
+          for k in ANTHROPIC_API_KEY WAID_CI_TOKEN; do
+            v=$(python3 -c "import json;print(json.load(open('$SF'),strict=False).get('$k',''))")
+            if [ -z "$v" ]; then echo "::error::secret $k ausente no Secrets Manager"; rm -f "$SF"; exit 1; fi
+            echo "::add-mask::$v"          # nunca aparece no log
+            echo "$k=$v" >> "$GITHUB_ENV"  # disponível pros steps seguintes
+          done
+          rm -f "$SF"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar deps + Claude Code
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile --prefer-offline || pnpm install
+          # pnpm v10 ignora postinstall scripts por padrão → o Prisma Client NÃO
+          # é gerado no install. Sem ele, o PrismaService não tem nenhum model e o
+          # typecheck (gate) quebra inteiro. Gera explicitamente (não precisa de DB).
+          npx prisma generate
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Editar (Claude Code — sem git, sem shell)
+        # ANTHROPIC_API_KEY vem do GITHUB_ENV (step "Carregar secrets"). WAID-1803
+        run: |
+          set -euo pipefail
+          INSTRUCTIONS=$(cat <<'EOF'
+          Você é o AI Dev (Ticket Resolver) da Waid. Resolva o ticket abaixo editando
+          APENAS os arquivos necessários, com o ESCOPO MÍNIMO. Trabalhe na cópia local.
+
+          Proibido (será BLOQUEADO pelo guard e o PR não abre): tocar migrations,
+          schema (.prisma), autenticação, pagamentos/billing, arquivos em .github/,
+          package.json. Se a solução exigir isso, NÃO edite — explique o porquê e pare.
+
+          Faça a mudança coerente com o código ao redor. Você NÃO tem shell; só edite
+          arquivos. A validação (typecheck) roda depois.
+          EOF
+          )
+          # Ticket vem de usuário → como DADO, via env, nunca interpolado no script.
+          # Context brief (análise do Deep Analyzer) entra ANTES da descrição crua:
+          # o AI Dev parte do entendimento já construído pelas IAs a montante
+          # (causa raiz, camada técnica, endpoints/repo prováveis) em vez do zero.
+          BRIEF_BLOCK=""
+          if [ -n "${CONTEXT_BRIEF:-}" ]; then
+            BRIEF_BLOCK=$(printf '\n\n--- CONTEXTO TÉCNICO (análise prévia das IAs Waid — use como ponto de partida, valide no código) ---\n%s\n--- fim do contexto ---' "$CONTEXT_BRIEF")
+          fi
+          PROMPT=$(printf '%s\n\nTicket WAID-%s: %s\n\nDescrição:\n%s%s' \
+            "$INSTRUCTIONS" "$PUBLIC_ID" "$TITLE" "$DESCRIPTION" "$BRIEF_BLOCK")
+          # Modelo vem da config do employer (--model). Vazio = default do Claude
+          # Code. Sem isso o AI Dev rodava sempre no default (Opus) — ~5x Sonnet.
+          MODEL_ARG=""
+          if [ -n "${MODEL:-}" ]; then MODEL_ARG="--model $MODEL"; fi
+          # Artefatos (result/cost) vão pra $RUNNER_TEMP — FORA do checkout — pra
+          # o `git add -A` do diff NÃO os commitar no PR (senão toda PR do AI Dev
+          # viria poluída com result.json/cost.json).
+          claude -p "$PROMPT" \
+            --allowedTools "Read,Grep,Glob,Edit,Write" \
+            --disallowedTools "Bash" \
+            $MODEL_ARG \
+            --output-format json > "$RUNNER_TEMP/result.json" || true
+          # Custo/tokens do Claude Code → cost.json (sempre existe, JSON válido).
+          # inputTokens soma cache (creation+read) — o custo é multi-turn, o
+          # usage.input_tokens sozinho subestima o consumo real. Vai nos callbacks.
+          node -e "const r=require('$RUNNER_TEMP/result.json');const u=r.usage||{};const o={};if(typeof r.total_cost_usd==='number')o.costUsd=r.total_cost_usd;const inTok=(u.input_tokens||0)+(u.cache_creation_input_tokens||0)+(u.cache_read_input_tokens||0);if(inTok>0)o.inputTokens=inTok;if(typeof u.output_tokens==='number')o.outputTokens=u.output_tokens;if(typeof r.duration_ms==='number')o.durationMs=r.duration_ms;process.stdout.write(JSON.stringify(o))" > "$RUNNER_TEMP/cost.json" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/cost.json"
+          echo "Custo capturado: $(cat "$RUNNER_TEMP/cost.json") | modelo: ${MODEL:-default}"
+
+      - name: Coletar diff
+        id: diff
+        run: |
+          set -euo pipefail
+          git add -A
+          # --no-renames: rename de path protegido aparece como add+delete → os
+          # dois caminhos (origem E destino) são checados pelo guard.
+          CHANGED=$(git diff --cached --name-only --no-renames)
+          echo "count=$(printf '%s' "$CHANGED" | grep -c . || true)" >> "$GITHUB_OUTPUT"
+          printf '%s' "$CHANGED" | jq -R -s 'split("\n") | map(select(length>0))' > changed.json
+          cat changed.json
+
+      - name: Guard (Approval Matrix + piso) — pode abrir PR?
+        id: guard
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.diff.outputs.count }}" = "0" ]; then
+            echo "allowed=empty" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          jq -n --arg repo "$REPO" --slurpfile p changed.json '{repo:$repo, changedPaths:$p[0]}' > guard-body.json
+          RESP=$(curl -fsS -X POST "$WAID_API_BASE/ai-native/dev/guard" \
+            -H "x-waid-ci-token: $WAID_CI_TOKEN" -H "Content-Type: application/json" --data @guard-body.json)
+          echo "$RESP" | jq .
+          echo "allowed=$(echo "$RESP" | jq -r '.data.allowed')" >> "$GITHUB_OUTPUT"
+          echo "$RESP" | jq -r '.data.blocked | map("\(.path) (\(.rule))") | join(", ")' > blocked.txt
+
+      - name: Escalar (guard bloqueou ou diff vazio)
+        if: steps.guard.outputs.allowed != 'true'
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.diff.outputs.count }}" = "0" ]; then
+            MSG="A A.I. não produziu mudanças — provavelmente faltou contexto."
+          else
+            MSG="Tocou caminho de cuidado/protegido: $(cat blocked.txt). Precisa de humano."
+          fi
+          jq -n --arg eid "$EXECUTION_ID" --arg msg "$MSG" --slurpfile cost "$RUNNER_TEMP/cost.json" \
+            '{status:"escalated", executionId:$eid, message:$msg} + ($cost[0] // {})' > body.json
+          curl -fsS -X POST "$WAID_API_BASE/ai-native/tickets/$TICKET_ID/ai-resolve" \
+            -H "x-waid-ci-token: $WAID_CI_TOKEN" -H "Content-Type: application/json" --data @body.json
+
+      - name: Typecheck (gate)
+        id: check
+        if: steps.guard.outputs.allowed == 'true'
+        run: |
+          set -e
+          # Usa tsconfig.build.json (config de produção) — NÃO o tsc completo.
+          # O tsc completo inclui scripts fora do build (mcp/, prisma/extract-*,
+          # import-zendesk) que têm erros pré-existentes e fariam QUALQUER run do
+          # AI Dev falhar o gate independente da mudança. O build.json cobre src/.
+          npx tsc -p tsconfig.build.json --noEmit 2> tsc.txt && echo "ok=true" >> "$GITHUB_OUTPUT" || echo "ok=false" >> "$GITHUB_OUTPUT"
+
+      - name: Falhou typecheck → escalar (sem PR)
+        if: steps.guard.outputs.allowed == 'true' && steps.check.outputs.ok != 'true'
+        run: |
+          set -euo pipefail
+          MSG="Mudança gerada quebrou o typecheck — não abri PR. $(tail -c 1200 tsc.txt | tr '\n' ' ')"
+          jq -n --arg eid "$EXECUTION_ID" --arg msg "$MSG" --slurpfile cost "$RUNNER_TEMP/cost.json" \
+            '{status:"failed", executionId:$eid, message:$msg} + ($cost[0] // {})' > body.json
+          curl -fsS -X POST "$WAID_API_BASE/ai-native/tickets/$TICKET_ID/ai-resolve" \
+            -H "x-waid-ci-token: $WAID_CI_TOKEN" -H "Content-Type: application/json" --data @body.json
+
+      - name: Abrir PR
+        if: steps.guard.outputs.allowed == 'true' && steps.check.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "waid-ai-dev[bot]"
+          git config user.email "ai-dev@waid.io"
+          git checkout -b "$BRANCH"
+          git commit -m "feat(ai-dev): resolve WAID-$PUBLIC_ID
+
+          $TITLE
+
+          Gerado pelo AI Dev (Ticket Resolver, Fase B). Revisar antes de mergear.
+
+          Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
+          git push origin "$BRANCH"
+          BODY=$(printf '🤖 PR gerado pelo **AI Dev** (Ticket Resolver, Fase B) pro ticket WAID-%s.\n\n**Revisão humana obrigatória.** Passou pelo guard (Approval Matrix + piso) e pelo typecheck. Segue o fluxo normal de release/aprovação. Não mergeie sem revisar o diff.' "$PUBLIC_ID")
+          PR_URL=$(gh pr create --base main --head "$BRANCH" \
+            --title "feat(ai-dev): WAID-$PUBLIC_ID — $TITLE" --body "$BODY")
+          echo "PR: $PR_URL"
+          jq -n --arg eid "$EXECUTION_ID" --arg pr "$PR_URL" --slurpfile cost "$RUNNER_TEMP/cost.json" \
+            '{status:"pr_opened", executionId:$eid, prUrl:$pr} + ($cost[0] // {})' > body.json
+          curl -fsS -X POST "$WAID_API_BASE/ai-native/tickets/$TICKET_ID/ai-resolve" \
+            -H "x-waid-ci-token: $WAID_CI_TOKEN" -H "Content-Type: application/json" --data @body.json
