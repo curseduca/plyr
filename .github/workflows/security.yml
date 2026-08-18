@@ -1,0 +1,60 @@
+name: Security
+
+# Varredura de segurança pela stack compartilhada, pinada em TAG
+# (curseduca/waid-cicd-stack@v1).
+#
+# Este arquivo é IDÊNTICO em toda a org, de propósito: os três workflows que ele
+# chama não têm nenhuma referência a pnpm, `package.json` ou `setup-node`, então
+# rodam em qualquer repositório, em qualquer linguagem — Node, Terraform, PHP,
+# Python, shell ou repositório só de docs. Não exige script novo, dependência
+# nova nem teste escrito.
+#
+# Por que existe: a cobertura de secret scanning e SAST na org era de 12
+# repositórios em 133. Este caller é a Onda 0 do PLANO-ADOCAO-STACK-FROTA.md —
+# a ação de maior relação cobertura/esforço do programa de CI/CD.
+#
+# Quem bloqueia e quem não:
+#
+#   - `Secret Scan` (gitleaks) e `SAST` (Semgrep) são **bloqueantes**. Dependem
+#     só do código: se reprovam, alguém introduziu o problema.
+#   - `Dependency Scan` (Trivy fs) é **advisory**, e isso não é temporário. Ele
+#     reprova quando um CVE é publicado, sem ninguém ter tocado no repositório.
+#     Com ele bloqueante, uma divulgação de madrugada trava as PRs do dia
+#     seguinte. Aconteceu em `curseduca-avaliacoes`: verde em 05/08, vermelho em
+#     13/08, zero commits no intervalo.
+#
+# Os três jobs NÃO recebem secret nenhum, de propósito: não instalam
+# dependência, e `secrets: inherit` num job que não precisa é exatamente a regra
+# `yaml.github-actions.security.secrets-inherit` que o próprio Semgrep aplica —
+# o caller reprovaria a si mesmo.
+#
+# `secret-scan` roda no escopo dos commits da PR (`full-history: false`, o
+# default). A varredura do histórico completo é uma operação de adoção separada:
+# pode achar credencial antiga, e credencial encontrada precisa ser
+# **rotacionada**, não só removida do commit.
+#
+# Ref: WAID-3224 · PLANO-ADOCAO-STACK-FROTA.md (Onda 0)
+
+on:
+    pull_request:
+    push:
+        branches: [master]
+
+concurrency:
+    group: security-${{ github.event_name == 'push' && github.ref || github.head_ref }}
+    cancel-in-progress: true
+
+jobs:
+    secret-scan:
+        name: Secret Scan
+        uses: curseduca/waid-cicd-stack/.github/workflows/secret-scan.yml@v1
+
+    sast:
+        name: SAST
+        uses: curseduca/waid-cicd-stack/.github/workflows/sast.yml@v1
+
+    deps-scan:
+        name: Dependency Scan
+        uses: curseduca/waid-cicd-stack/.github/workflows/deps-scan.yml@v1
+        with:
+            advisory: true
