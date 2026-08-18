@@ -13,15 +13,9 @@ name: Security
 # repositórios em 133. Este caller é a Onda 0 do PLANO-ADOCAO-STACK-FROTA.md —
 # a ação de maior relação cobertura/esforço do programa de CI/CD.
 #
-# Quem bloqueia e quem não:
-#
-#   - `Secret Scan` (gitleaks) e `SAST` (Semgrep) são **bloqueantes**. Dependem
-#     só do código: se reprovam, alguém introduziu o problema.
-#   - `Dependency Scan` (Trivy fs) é **advisory**, e isso não é temporário. Ele
-#     reprova quando um CVE é publicado, sem ninguém ter tocado no repositório.
-#     Com ele bloqueante, uma divulgação de madrugada trava as PRs do dia
-#     seguinte. Aconteceu em `curseduca-avaliacoes`: verde em 05/08, vermelho em
-#     13/08, zero commits no intervalo.
+# Os três jobs entram **advisory**: rodam, publicam relatório no resumo da run e
+# não reprovam PR. A razão está medida na seção abaixo — não é preferência, é o
+# que o lote piloto mostrou. Sair do advisory é trabalho na stack, não aqui.
 #
 # Os três jobs NÃO recebem secret nenhum, de propósito: não instalam
 # dependência, e `secrets: inherit` num job que não precisa é exatamente a regra
@@ -33,6 +27,36 @@ name: Security
 # pode achar credencial antiga, e credencial encontrada precisa ser
 # **rotacionada**, não só removida do commit.
 #
+#
+# ## Por que `Secret Scan` e `SAST` entram ADVISORY (medido em 18/08/2026)
+#
+# A versão anterior deste arquivo tinha os dois bloqueantes, com a justificativa
+# de que "dependem só do código". A justificativa está certa e a conclusão
+# estava errada: o código da frota já viola os dois, em massa, desde antes de
+# qualquer PR. Medição do lote piloto — 9 repositórios, 5 linguagens:
+#
+#   - `SAST` reprovou em 8 de 9.
+#   - `Secret Scan` reprovou em 5 de 9.
+#
+# E as causas não são achados de segurança de verdade:
+#
+#   - `github-actions-mutable-action-tag`: o Semgrep reprova `uses: ...@v4` e
+#     `@v1` por serem tag móvel. É **exatamente a estratégia de pinagem que esta
+#     org escolheu** — a `waid-cicd-stack` é consumida em `@v1` de propósito,
+#     com a tag movida por decisão. Satisfazer a regra exigiria pinar toda action
+#     em SHA e desmontar esse desenho.
+#   - `dependabot-missing-cooldown`, `npm-missing-minimum-release-age`: regras de
+#     higiene de supply chain que o Semgrep **publicou depois** do código
+#     existir. São scanner de calendário com outra roupa: entram vermelhas sem
+#     ninguém ter tocado no repositório.
+#   - `generic-api-key` do gitleaks batendo em **`README.md`** — badge de
+#     boilerplate do NestJS com `?token=` na URL. Falso positivo, e a stack não
+#     tem hoje mecanismo de allowlist (`.gitleaks.toml`) para calar.
+#
+# Então: os dois rodam, publicam relatório e **não travam PR de ninguém**. Sair
+# do advisory depende de trabalho na stack (ruleset curado do Semgrep + allowlist
+# do gitleaks), não de trabalho neste repositório.
+
 # Ref: WAID-3224 · PLANO-ADOCAO-STACK-FROTA.md (Onda 0)
 
 on:
@@ -48,10 +72,14 @@ jobs:
     secret-scan:
         name: Secret Scan
         uses: curseduca/waid-cicd-stack/.github/workflows/secret-scan.yml@v1
+        with:
+            advisory: true
 
     sast:
         name: SAST
         uses: curseduca/waid-cicd-stack/.github/workflows/sast.yml@v1
+        with:
+            advisory: true
 
     deps-scan:
         name: Dependency Scan
